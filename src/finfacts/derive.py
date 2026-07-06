@@ -29,6 +29,18 @@ REVENUE = (
     "us-gaap:SalesRevenueNet",
 )
 NET_INCOME = ("us-gaap:NetIncomeLoss",)
+# dei:EntityPublicFloat is the dollar value of the public float — free-float
+# market cap straight from the filing, no share-count multiplication needed
+PUBLIC_FLOAT = ("dei:EntityPublicFloat",)
+BOOK_EQUITY = (
+    "us-gaap:StockholdersEquity",
+    "us-gaap:StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+)
+CAPEX = ("us-gaap:PaymentsToAcquirePropertyPlantAndEquipment",)
+OPEX = (
+    "us-gaap:OperatingExpenses",
+    "us-gaap:CostsAndExpenses",
+)
 
 
 def _days(f: FinFact) -> int:
@@ -55,6 +67,20 @@ def _quarterly(fs: FactSet, concepts: tuple) -> list[FinFact]:
             }
             return sorted(dedup.values(), key=lambda f: f.period.end)
     return []
+
+
+def _latest_instant(fs: FactSet, concepts: tuple) -> Optional[FinFact]:
+    """Most recent instant fact for the first concept that has any."""
+    for concept in concepts:
+        rows = [f for f in fs.facts if f.concept == concept and not f.period.start]
+        if rows:
+            # latest restatement wins per period (accessions sort chronologically)
+            dedup = {
+                f.period.end: f
+                for f in sorted(rows, key=lambda f: f.source.ref)
+            }
+            return max(dedup.values(), key=lambda f: f.period.end)
+    return None
 
 
 def _ratio_fact(entity_id: str, concept: str, numer: FinFact, denom: FinFact, period: Period) -> FinFact:
@@ -103,6 +129,20 @@ def margin(numer: Optional[FinFact], denom: Optional[FinFact], out_concept: str)
     return _ratio_fact(numer.entity_id, out_concept, numer, denom, numer.period)
 
 
+def instant_ratio(numer: Optional[FinFact], denom: Optional[FinFact], out_concept: str) -> Optional[FinFact]:
+    """Point-in-time ratio (instant/instant or ttm/instant), e.g. B/M on free float."""
+    if not numer or not denom or denom.value <= 0:
+        return None
+    if numer.unit != "USD" or denom.unit != "USD":  # apples-to-apples dollars only
+        return None
+    gap = abs(date.fromisoformat(numer.period.end)
+              - date.fromisoformat(denom.period.end)).days
+    if gap > 400:  # a fresh float against years-old fundamentals is meaningless
+        return None
+    return _ratio_fact(numer.entity_id, out_concept, numer, denom,
+                       Period(end=max(numer.period.end, denom.period.end)))
+
+
 def yoy_growth(fs: FactSet, concepts: tuple, out_concept: str) -> Optional[FinFact]:
     """Year-over-year growth of the most recent quarter vs the same quarter last year."""
     q = _quarterly(fs, concepts)
@@ -138,14 +178,23 @@ def yoy_growth(fs: FactSet, concepts: tuple, out_concept: str) -> Optional[FinFa
 
 
 def derive_all(fs: FactSet) -> list[FinFact]:
-    """Standard smart pack: TTM revenue/income, net margin, YoY growth."""
+    """Standard smart pack: TTM lines, margin, YoY growth, free-float F&F ratios."""
     rev_ttm = ttm(fs, REVENUE, "finfield:revenue_ttm")
     ni_ttm = ttm(fs, NET_INCOME, "finfield:net_income_ttm")
+    capex_ttm = ttm(fs, CAPEX, "finfield:capex_ttm")
+    opex_ttm = ttm(fs, OPEX, "finfield:opex_ttm")
+    float_mcap = _latest_instant(fs, PUBLIC_FLOAT)
+    book = _latest_instant(fs, BOOK_EQUITY)
     out = [
         rev_ttm,
         ni_ttm,
+        capex_ttm,
+        opex_ttm,
         margin(ni_ttm, rev_ttm, "finfield:net_margin_ttm"),
         yoy_growth(fs, REVENUE, "finfield:revenue_yoy"),
         yoy_growth(fs, NET_INCOME, "finfield:net_income_yoy"),
+        instant_ratio(book, float_mcap, "finfield:book_to_float_mcap"),
+        instant_ratio(ni_ttm, float_mcap, "finfield:earnings_to_float_mcap"),
+        instant_ratio(capex_ttm, float_mcap, "finfield:capex_to_float_mcap"),
     ]
     return [f for f in out if f is not None]
