@@ -17,6 +17,7 @@ from typing import Optional
 from finfacts.model import FactSet, FinFact, Period, Source
 
 DERIVED = Source(kind="finfield-derived", ref="finfield.smart.derive")
+Q4_SYNTH = Source(kind="finfield-derived", ref="finfacts.derive.synthesize_q4")
 RATIO_SCALE = 6
 # every node must mint the same ratio bytes regardless of the host app's
 # ambient decimal context
@@ -65,25 +66,142 @@ def _days(f: FinFact) -> int:
     return (e - s).days
 
 
+def _same_quarter(a: FinFact, b: FinFact) -> bool:
+    """True when two duration rows are the same fiscal quarter (restatements).
+
+    Matching (fiscal_year, fiscal_period) is definitive; otherwise periods
+    overlapping by more than half the shorter row are the same quarter
+    refiled with shifted dates (CLOW US restated Q1s start one day apart).
+    """
+    pa, pb = a.period, b.period
+    if (pa.fiscal_year is not None and pa.fiscal_year == pb.fiscal_year
+            and pa.fiscal_period == pb.fiscal_period):
+        return True
+    sa, ea = date.fromisoformat(pa.start), date.fromisoformat(pa.end)
+    sb, eb = date.fromisoformat(pb.start), date.fromisoformat(pb.end)
+    overlap = (min(ea, eb) - max(sa, sb)).days + 1  # inclusive days
+    shortest = min((ea - sa).days, (eb - sb).days) + 1
+    return 2 * overlap > shortest
+
+
+def _concept_quarters(fs: FactSet, concept: str) -> list[FinFact]:
+    """Deduped duration facts of ~one quarter for one concept, sorted by end."""
+    rows = [
+        f
+        for f in fs.facts
+        if f.concept == concept
+        and f.period.start
+        and f.period.fiscal_period in ("Q1", "Q2", "Q3", "Q4")
+        and _days(f) <= 100
+    ]
+    # latest restatement wins per quarter (accessions sort chronologically);
+    # fuzzy match so refiled rows with shifted dates still collapse
+    kept: list[FinFact] = []
+    for f in sorted(rows, key=lambda f: (f.source.ref, f.period.end, f.period.start)):
+        for i, g in enumerate(kept):
+            if _same_quarter(f, g):
+                kept[i] = f
+                break
+        else:
+            kept.append(f)
+    return sorted(kept, key=lambda f: f.period.end)
+
+
 def _quarterly(fs: FactSet, concepts: tuple) -> list[FinFact]:
     """Duration facts of ~one quarter for the first concept that has them."""
     for concept in concepts:
-        rows = [
-            f
-            for f in fs.facts
-            if f.concept == concept
-            and f.period.start
-            and f.period.fiscal_period in ("Q1", "Q2", "Q3", "Q4")
-            and _days(f) <= 100
-        ]
-        if rows:
-            # latest restatement wins per period (accessions sort chronologically)
-            dedup = {
-                (f.period.start, f.period.end): f
-                for f in sorted(rows, key=lambda f: f.source.ref)
-            }
-            return sorted(dedup.values(), key=lambda f: f.period.end)
+        q = _concept_quarters(fs, concept)
+        if q:
+            return q
     return []
+
+
+def _annual(fs: FactSet, concept: str) -> dict:
+    """Latest FY duration fact per fiscal year for one concept.
+
+    companyfacts `fp` labels the filing, not the data (10-K rows say "FY"
+    whatever they span), so the ~12-month span — 52/53-week safe — is the
+    real annual discriminator; fiscal_year is required to key the match
+    against that year's Q1-Q3.
+    """
+    rows = [
+        f
+        for f in fs.facts
+        if f.concept == concept
+        and f.period.start
+        and f.period.fiscal_year is not None
+        and 340 <= _days(f) <= 380
+    ]
+    out: dict = {}
+    for f in sorted(rows, key=lambda f: (f.source.ref, f.period.end, f.period.start)):
+        out[f.period.fiscal_year] = f  # latest restatement wins
+    return out
+
+
+def synthesize_q4(fs: FactSet, concepts: tuple) -> list[FinFact]:
+    """Synthesize missing standalone Q4 facts as FY - Q1 - Q2 - Q3.
+
+    SEC companyfacts reports the fourth quarter inside the FY duration, not
+    as a standalone row, so real Q4 rows are nearly absent. For every fiscal
+    year of the first concept with quarterly data where an FY total plus
+    exactly Q1-Q3 exist (post-dedupe) and no real Q4 does, the difference is
+    minted as a Q4 fact whose derived_from chains back to all four inputs.
+    A negative Q4 is legitimate (a loss quarter) and is kept.
+    """
+    for concept in concepts:
+        q = _concept_quarters(fs, concept)
+        if q:
+            return _synthesize_q4(fs, concept, q)
+    return []
+
+
+def _synthesize_q4(fs: FactSet, concept: str, q: list[FinFact]) -> list[FinFact]:
+    by_fy: dict = defaultdict(dict)
+    for f in q:
+        if f.period.fiscal_year is not None:
+            by_fy[f.period.fiscal_year][f.period.fiscal_period] = f
+    out = []
+    for fy, fy_fact in sorted(_annual(fs, concept).items()):
+        fps = by_fy.get(fy, {})
+        if "Q4" in fps:  # never shadow a real Q4
+            continue
+        if not all(p in fps for p in ("Q1", "Q2", "Q3")):
+            continue
+        inputs = (fy_fact, fps["Q1"], fps["Q2"], fps["Q3"])
+        if len({f.unit for f in inputs}) != 1:  # apples-to-apples only
+            continue
+        start = date.fromisoformat(fps["Q3"].period.end) + timedelta(days=1)
+        span = (date.fromisoformat(fy_fact.period.end) - start).days
+        if not 0 < span <= 100:  # mislabeled years would mint a non-quarter
+            continue
+        common = max(f.scale for f in inputs)
+        fy_v, q1_v, q2_v, q3_v = (f.value * 10 ** (common - f.scale) for f in inputs)
+        out.append(
+            FinFact(
+                entity_id=fy_fact.entity_id,
+                concept=concept,
+                value=fy_v - q1_v - q2_v - q3_v,
+                scale=common,
+                unit=fy_fact.unit,
+                period=Period(
+                    start=start.isoformat(),
+                    end=fy_fact.period.end,
+                    fiscal_year=fy,
+                    fiscal_period="Q4",
+                ),
+                source=Q4_SYNTH,
+                derived_from=tuple(f.cid for f in inputs),
+            )
+        )
+    return out
+
+
+def quarters(fs: FactSet, concepts: tuple) -> list[FinFact]:
+    """Real quarterly facts plus synthesized Q4s: one uniform timeline."""
+    return sorted(
+        _quarterly(fs, concepts) + synthesize_q4(fs, concepts),
+        key=lambda f: f.period.end,
+    )
 
 
 def _latest_instant(fs: FactSet, concepts: tuple) -> Optional[FinFact]:
@@ -117,11 +235,18 @@ def _ratio_fact(entity_id: str, concept: str, numer: FinFact, denom: FinFact, pe
 
 
 def ttm(fs: FactSet, concepts: tuple, out_concept: str) -> Optional[FinFact]:
-    """Trailing-twelve-months sum of the last four distinct quarters."""
-    q = _quarterly(fs, concepts)
+    """Trailing-twelve-months sum of the last four adjacent quarters."""
+    q = quarters(fs, concepts)
     if len(q) < 4:
         return None
     last4 = q[-4:]
+    for prev, nxt in zip(last4, last4[1:]):
+        # each quarter must pick up where the previous ended (calendar slop
+        # for 52/53-week fiscal years); a hole or an overlap sums a wrong year
+        gap = (date.fromisoformat(nxt.period.start)
+               - date.fromisoformat(prev.period.end)).days
+        if not -6 <= gap <= 7:
+            return None
     span = (date.fromisoformat(last4[-1].period.end)
             - date.fromisoformat(last4[0].period.start)).days
     if not 350 <= span <= 380:  # four contiguous quarters, no gaps/restated holes
@@ -242,7 +367,7 @@ def instant_yoy(fs: FactSet, concepts: tuple, out_concept: str) -> Optional[FinF
 
 def yoy_growth(fs: FactSet, concepts: tuple, out_concept: str) -> Optional[FinFact]:
     """Year-over-year growth of the most recent quarter vs the same quarter last year."""
-    q = _quarterly(fs, concepts)
+    q = quarters(fs, concepts)
     if not q:
         return None
     by_fp = defaultdict(list)

@@ -12,6 +12,7 @@ from finfacts.derive import (
     _latest_instant,
     derive_all,
     instant_ratio,
+    synthesize_q4,
     ttm,
     yoy_growth,
 )
@@ -180,3 +181,165 @@ def test_derive_determinism():
     a = sorted(f.cid for f in derive_all(_full_fs()))
     b = sorted(f.cid for f in derive_all(_full_fs()))
     assert a == b and len(a) == 10
+
+
+def _dur(value, start, end, fy, fp, ref="acc", unit="USD", scale=0, concept=REVENUE[1]):
+    return FinFact(
+        entity_id="ticker:TEST US", concept=concept, value=value, unit=unit, scale=scale,
+        period=Period(end=end, start=start, fiscal_year=fy, fiscal_period=fp),
+        source=Source(kind="sec-companyfacts", ref=ref, fetched="2026-07-06"),
+    )
+
+
+def _fs_of(*facts):
+    fs = FactSet(entity=Entity(ticker="TEST US"))
+    for f in facts:
+        fs.add(f)
+    return fs
+
+
+# 14 — CLOW US regression: Q3-2016 + two restated Q1-2017 rows (starts one day
+# apart, same fy/fp) + Q2-2017 must NOT mint a TTM that double-counts Q1
+def test_ttm_clow_restated_q1_not_double_counted():
+    fs = _fs_of(
+        _dur(100, "2016-07-01", "2016-09-30", 2016, "Q3", ref="acc-1"),
+        _dur(200, "2017-01-01", "2017-03-31", 2017, "Q1", ref="acc-2"),
+        _dur(210, "2017-01-02", "2017-03-31", 2017, "Q1", ref="acc-3"),  # restated
+        _dur(300, "2017-04-01", "2017-06-30", 2017, "Q2", ref="acc-4"),
+    )
+    assert ttm(fs, REVENUE, "x") is None  # dedupes to 3 quarters, Q4-2016 missing
+
+
+# 15 — restatement happy path: the refiled row (same fy/fp, start +1 day)
+# replaces the original; TTM sums the restated value and links its CID
+def test_ttm_restatement_latest_accession_wins():
+    restated = _dur(220, "2024-04-02", "2024-06-30", 2024, "Q2", ref="acc-3")
+    fs = _fs_of(
+        _dur(100, "2024-01-01", "2024-03-31", 2024, "Q1", ref="acc-1"),
+        _dur(200, "2024-04-01", "2024-06-30", 2024, "Q2", ref="acc-2"),
+        restated,
+        _dur(300, "2024-07-01", "2024-09-30", 2024, "Q3", ref="acc-4"),
+        _dur(400, "2024-10-01", "2024-12-31", 2024, "Q4", ref="acc-5"),
+    )
+    f = ttm(fs, REVENUE, "x")
+    assert f.value == 100 + 220 + 300 + 400
+    assert restated.cid in f.derived_from and len(f.derived_from) == 4
+
+
+# 16 — adjacency: four quarters whose total span passes the gate but with a
+# hole between Q2 and Q3 are rejected, not summed
+def test_ttm_adjacency_hole_rejected():
+    fs = _fs_of(
+        _dur(100, "2024-01-01", "2024-03-31", 2024, "Q1"),
+        _dur(200, "2024-04-01", "2024-06-30", 2024, "Q2"),
+        _dur(300, "2024-08-01", "2024-10-31", 2024, "Q3"),  # 32-day hole
+        _dur(400, "2024-11-01", "2024-12-31", 2024, "Q4"),
+    )
+    assert ttm(fs, REVENUE, "x") is None
+
+
+# 17 — Q4 synthesis: FY - Q1 - Q2 - Q3, exact across mixed scales
+def test_synthesize_q4_exact_mixed_scales():
+    fy = _dur(1000, "2024-01-01", "2024-12-31", 2024, "FY", ref="acc-9")
+    q1 = _dur(200000, "2024-01-01", "2024-03-31", 2024, "Q1", scale=3)  # 200 USD
+    q2 = _dur(250, "2024-04-01", "2024-06-30", 2024, "Q2")
+    q3 = _dur(300, "2024-07-01", "2024-09-30", 2024, "Q3")
+    out = synthesize_q4(_fs_of(fy, q1, q2, q3), REVENUE)
+    assert len(out) == 1
+    f = out[0]
+    assert f.value == 250000 and f.scale == 3  # 1000 - 200 - 250 - 300 = 250 USD
+    assert f.decimal == Decimal("250")
+    assert f.concept == REVENUE[1] and f.unit == "USD"
+    assert f.period.start == "2024-10-01" and f.period.end == "2024-12-31"
+    assert f.period.fiscal_year == 2024 and f.period.fiscal_period == "Q4"
+    assert f.source.kind == "finfield-derived"
+    assert f.source.ref == "finfacts.derive.synthesize_q4"
+    assert f.derived_from == (fy.cid, q1.cid, q2.cid, q3.cid)
+
+
+# 18 — never synthesize when a real Q4 already exists for that fiscal year
+def test_synthesize_q4_real_q4_wins():
+    out = synthesize_q4(_fs_of(
+        _dur(1000, "2024-01-01", "2024-12-31", 2024, "FY"),
+        _dur(100, "2024-01-01", "2024-03-31", 2024, "Q1"),
+        _dur(200, "2024-04-01", "2024-06-30", 2024, "Q2"),
+        _dur(300, "2024-07-01", "2024-09-30", 2024, "Q3"),
+        _dur(400, "2024-10-01", "2024-12-31", 2024, "Q4"),
+    ), REVENUE)
+    assert out == []
+
+
+# 19 — no synthesis when any of Q1-Q3 is missing
+def test_synthesize_q4_missing_quarter():
+    out = synthesize_q4(_fs_of(
+        _dur(1000, "2024-01-01", "2024-12-31", 2024, "FY"),
+        _dur(100, "2024-01-01", "2024-03-31", 2024, "Q1"),
+        _dur(300, "2024-07-01", "2024-09-30", 2024, "Q3"),
+    ), REVENUE)
+    assert out == []
+
+
+# 20 — unit mismatch across the four inputs skips synthesis
+def test_synthesize_q4_unit_mismatch():
+    out = synthesize_q4(_fs_of(
+        _dur(1000, "2024-01-01", "2024-12-31", 2024, "FY"),
+        _dur(100, "2024-01-01", "2024-03-31", 2024, "Q1"),
+        _dur(200, "2024-04-01", "2024-06-30", 2024, "Q2", unit="EUR"),
+        _dur(300, "2024-07-01", "2024-09-30", 2024, "Q3"),
+    ), REVENUE)
+    assert out == []
+
+
+# 21 — a negative synthesized Q4 (loss quarter) is real and kept
+def test_synthesize_q4_negative_allowed():
+    out = synthesize_q4(_fs_of(
+        _dur(500, "2024-01-01", "2024-12-31", 2024, "FY"),
+        _dur(200, "2024-01-01", "2024-03-31", 2024, "Q1"),
+        _dur(200, "2024-04-01", "2024-06-30", 2024, "Q2"),
+        _dur(200, "2024-07-01", "2024-09-30", 2024, "Q3"),
+    ), REVENUE)
+    assert len(out) == 1 and out[0].value == -100
+
+
+# 22 — TTM over Q1-Q3 + synthesized Q4 equals the FY total exactly,
+# with the synthesized fact's CID in the provenance chain
+def test_ttm_with_synthesized_q4_equals_fy():
+    fy = _dur(1000, "2024-01-01", "2024-12-31", 2024, "FY")
+    q1 = _dur(100, "2024-01-01", "2024-03-31", 2024, "Q1")
+    q2 = _dur(200, "2024-04-01", "2024-06-30", 2024, "Q2")
+    q3 = _dur(300, "2024-07-01", "2024-09-30", 2024, "Q3")
+    fs = _fs_of(fy, q1, q2, q3)
+    synth = synthesize_q4(fs, REVENUE)[0]
+    f = ttm(fs, REVENUE, "finfield:revenue_ttm")
+    assert f.value == 1000 and f.decimal == fy.decimal
+    assert f.period.start == "2024-01-01" and f.period.end == "2024-12-31"
+    assert f.derived_from == (q1.cid, q2.cid, q3.cid, synth.cid)
+    assert synth.derived_from == (fy.cid, q1.cid, q2.cid, q3.cid)
+
+
+# 23 — yoy_growth sees synthesized quarters uniformly with real ones
+def test_yoy_with_synthesized_q4():
+    fs = _fs_of(
+        _dur(100, "2023-10-01", "2023-12-31", 2023, "Q4"),  # real prior-year Q4
+        _dur(100, "2024-01-01", "2024-03-31", 2024, "Q1"),
+        _dur(200, "2024-04-01", "2024-06-30", 2024, "Q2"),
+        _dur(300, "2024-07-01", "2024-09-30", 2024, "Q3"),
+        _dur(1000, "2024-01-01", "2024-12-31", 2024, "FY"),  # synth Q4 = 400
+    )
+    f = yoy_growth(fs, REVENUE, "x")
+    assert f.decimal == Decimal("3")  # Q4: 400 vs 100
+
+
+# 24 — synthesis is deterministic: independent runs mint identical CIDs
+def test_synthesize_q4_determinism():
+    def build():
+        return _fs_of(
+            _dur(1000, "2024-01-01", "2024-12-31", 2024, "FY"),
+            _dur(100, "2024-01-01", "2024-03-31", 2024, "Q1"),
+            _dur(200, "2024-04-01", "2024-06-30", 2024, "Q2"),
+            _dur(300, "2024-07-01", "2024-09-30", 2024, "Q3"),
+        )
+    a = [f.cid for f in synthesize_q4(build(), REVENUE)]
+    b = [f.cid for f in synthesize_q4(build(), REVENUE)]
+    assert a == b and len(a) == 1
+    assert ttm(build(), REVENUE, "x").cid == ttm(build(), REVENUE, "x").cid
