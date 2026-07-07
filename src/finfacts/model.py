@@ -99,6 +99,11 @@ class FinFact:
     source: Source
     scale: int = 0
     derived_from: tuple = ()  # CIDs of input facts, for derived concepts
+    # dimensional qualifiers ((axis, member), ...) for segment facts — e.g. a
+    # geographic revenue breakdown from an ESEF/XBRL filing. A fact without
+    # dimensions is the consolidated line; its payload carries no dimensions
+    # key at all, so every pre-existing fact keeps its exact CID.
+    dimensions: tuple = ()
 
     @property
     def decimal(self) -> Decimal:
@@ -109,6 +114,11 @@ class FinFact:
         d["derived_from"] = list(self.derived_from)
         # drop empty optionals so equal facts canonicalize identically
         d["period"] = {k: v for k, v in d["period"].items() if v is not None}
+        if self.dimensions:
+            # a dimension set is unordered: sort so equal facts share one CID
+            d["dimensions"] = sorted([axis, member] for axis, member in self.dimensions)
+        else:
+            del d["dimensions"]
         return d
 
     @property
