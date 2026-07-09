@@ -49,8 +49,15 @@ def cid(obj: Any) -> str:
 class Entity:
     """A listed company, keyed on its composite ticker (e.g. 'AAPL US').
 
-    Only open identifiers are carried; licensed schemes (SEDOL, GICS) are
-    deliberately absent so entities are safe to publish.
+    The Entity carries only open identifiers inline. Classification schemes are
+    NOT embedded here — they are woven as separate, provenance-bearing
+    classification knits + fibers (see :mod:`finfacts.classification`), each
+    citing the public source it was read from (e.g. the SEC's public-domain SIC
+    list) or explicitly marked ``method="derived"`` when it is our own estimate.
+    Keeping classifications out of the entity payload means the entity record
+    stays byte-stable, and any scheme — including a published/derived mapping to
+    a licensed taxonomy — is carried only via an attributed fiber, never copied
+    as bulk reference data.
     """
 
     ticker: str
